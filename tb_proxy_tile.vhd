@@ -3,7 +3,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 use work.esp_global.all;
 use work.nocpackage.all;
-
+use std.env.all;
 entity tb_proxy_tile is
 end entity;
 
@@ -283,6 +283,7 @@ begin
     rx_valid_i <= '0';
 
     report "tb_proxy_tile completed successfully" severity note;
+    stop;
     wait;
   end process;
 end architecture;
