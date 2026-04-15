@@ -79,7 +79,10 @@ entity proxy_tile is
     -- Credit flow control
     ---------------------------------------------------------------------------
     credit_return_i : in  std_logic;
-    credit_pulse_o  : out std_logic
+    credit_pulse_o  : out std_logic;
+        dbg_fifo_wr_ptr_0 : out integer;
+    dbg_fifo_count_0  : out integer;
+    dbg_state : out integer
   );
   end entity;
   architecture rtl of proxy_tile is
@@ -207,6 +210,8 @@ entity proxy_tile is
   signal tx_valid_int      : std_ulogic;
   signal tx_plane_int      : std_logic_vector(2 downto 0);
   signal tx_fire           : std_ulogic;
+  signal tx_flit_hold  : link_flit_t := (others => '0');
+signal tx_plane_hold : std_logic_vector(2 downto 0) := (others => '0');
 
   signal rx_ready_int      : std_ulogic;
   signal rx_fire           : std_ulogic;
@@ -351,46 +356,56 @@ entity proxy_tile is
   -- The FSM pops one flit at a time from the active plane FIFO.
   -----------------------------------------------------------------------------
   process(all)
-  begin
-    tx_flit_int  <= (others => '0');
-    tx_valid_int <= '0';
-    tx_plane_int <= "000";
-    fifo_rd_en   <= (others => '0');
+begin
+  tx_flit_int  <= tx_flit_hold;
+  tx_valid_int <= '0';
+  tx_plane_int <= tx_plane_hold;
+  fifo_rd_en   <= (others => '0');
 
-    if st = S_SEND_PKT then
-      tx_flit_int  <= fifo_dout_arr(active_plane);
-      tx_plane_int <= plane_to_id(active_plane);
-      tx_valid_int <= plane_has_data(active_plane) and tx_credit_ok;
-      fifo_rd_en(active_plane) <= tx_ready_i and tx_credit_ok and plane_has_data(active_plane);
-    end if;
-  end process;
+  if st = S_SEND_PKT then
+    tx_valid_int <= plane_has_data(active_plane) and tx_credit_ok;
+    fifo_rd_en(active_plane) <= tx_ready_i and tx_credit_ok and plane_has_data(active_plane);
+  end if;
+end process;
 
   tx_fire <= tx_valid_int and tx_ready_i;
   ---------------------------------------------------------------------------
   -- Main FSM: lock a plane, then keep forwarding until TAIL / 1FLIT.
   ---------------------------------------------------------------------------
   process(clk, rstn)
-  begin
-    if rstn = '0' then
-      st           <= S_IDLE;
-      active_plane <= 0;
-      last_grant   <= 0;
-    elsif rising_edge(clk) then
-      case st is
-        when S_IDLE =>
-          if grant_valid = '1' then
-            active_plane <= grant_plane;
-            last_grant   <= grant_plane;
-            st           <= S_SEND_PKT;
-          end if;
+  variable next_ptr : integer range 0 to G_FIFO_DEPTH - 1;
+begin
+  if rstn = '0' then
+    st            <= S_IDLE;
+    active_plane  <= 0;
+    last_grant    <= 0;
+    tx_flit_hold  <= (others => '0');
+    tx_plane_hold <= (others => '0');
 
-        when S_SEND_PKT =>
-          if tx_fire = '1' and plane_is_tail(active_plane, fifo_dout_arr(active_plane)) then
+  elsif rising_edge(clk) then
+    case st is
+      when S_IDLE =>
+        if grant_valid = '1' then
+          active_plane  <= grant_plane;
+          last_grant    <= grant_plane;
+          tx_flit_hold  <= fifo_dout_arr(grant_plane);
+          tx_plane_hold <= plane_to_id(grant_plane);
+          st            <= S_SEND_PKT;
+        end if;
+
+      when S_SEND_PKT =>
+        if tx_fire = '1' then
+          if plane_is_tail(active_plane, fifo_dout_arr(active_plane)) then
             st <= S_IDLE;
+          else
+            next_ptr := inc_ptr(fifo_rd_ptr(active_plane));
+            tx_flit_hold  <= fifo_mem(active_plane)(next_ptr);
+            tx_plane_hold <= plane_to_id(active_plane);
           end if;
-      end case;
-    end if;
-  end process;
+        end if;
+    end case;
+  end if;
+end process;
 
 ---------------------------------------------------------------------------
   -- Reverse link routing back into the correct local NoC plane.
@@ -459,6 +474,9 @@ entity proxy_tile is
 
   rx_ready_o     <= rx_ready_int;
   credit_pulse_o <= credit_pulse_int;
+    dbg_fifo_wr_ptr_0 <= fifo_wr_ptr(0);
+  dbg_fifo_count_0  <= fifo_count(0);
+  dbg_state <= 0 when st = S_IDLE else 1;
 
 
   -- rx_clk_i is intentionally unused in this version. If RX is truly in another
