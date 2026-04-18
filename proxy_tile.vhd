@@ -102,7 +102,18 @@ entity proxy_tile is
   type fifo_mem_t         is array (0 to G_NPLANES - 1) of fifo_mem_plane_t;
   type ptr_arr_t          is array (0 to G_NPLANES - 1) of integer range 0 to G_FIFO_DEPTH - 1;
   type cnt_arr_t          is array (0 to G_NPLANES - 1) of integer range 0 to G_FIFO_DEPTH;
-  type state_t            is (S_IDLE, S_SEND_PKT);
+  type state_t is (
+  S_IDLE,
+  S_HDR,
+  S_ADDR,
+  S_LEN,
+  S_RD_TX,
+  S_RD_WAIT,
+  S_WR_TX_META,
+  S_WR_TX_DATA
+);
+type pkt_kind_t is (PKT_NONE, PKT_READ, PKT_WRITE);
+
 -- for to check if the plane has any data
   function has_any(valids : std_logic_vector) return boolean is
   begin
@@ -141,21 +152,39 @@ entity proxy_tile is
       return p + 1;
     end if;
   end function;
-
-  function plane_is_header(plane : natural; flit : link_flit_t) return boolean is
+  function flit_preamble(plane : natural; flit : link_flit_t) return noc_preamble_type is
     variable p : noc_preamble_type;
   begin
     case plane is
       when 0 | 1 | 2 =>
-        p := get_preamble(COH_NOC_FLIT_SIZE, coh_noc_flit_pad & flit(COH_NOC_FLIT_SIZE-1 downto 0));
+        p := get_preamble(
+               COH_NOC_FLIT_SIZE,
+               coh_noc_flit_pad & flit(COH_NOC_FLIT_SIZE - 1 downto 0)
+             );
       when 3 | 5 =>
-        p := get_preamble(DMA_NOC_FLIT_SIZE, dma_noc_flit_pad & flit(DMA_NOC_FLIT_SIZE-1 downto 0));
+        p := get_preamble(
+               DMA_NOC_FLIT_SIZE,
+               dma_noc_flit_pad & flit(DMA_NOC_FLIT_SIZE - 1 downto 0)
+             );
       when 4 =>
-        p := get_preamble_misc(flit(MISC_NOC_FLIT_SIZE-1 downto 0));
+        p := get_preamble_misc(flit(MISC_NOC_FLIT_SIZE - 1 downto 0));
       when others =>
         p := PREAMBLE_BODY;
     end case;
-    return (p = PREAMBLE_HEADER) or (p = PREAMBLE_1FLIT);  
+    return p;
+  end function;
+
+  function plane_is_header(plane : natural; flit : link_flit_t) return boolean is
+  variable p : noc_preamble_type;
+begin
+  p := flit_preamble(plane, flit);
+  return (p = PREAMBLE_HEADER) or (p = PREAMBLE_1FLIT);
+end function;
+  function plane_is_tail(plane : natural; flit : link_flit_t) return boolean is
+    variable p : noc_preamble_type;
+  begin
+    p := flit_preamble(plane, flit);
+    return (p = PREAMBLE_TAIL) or (p = PREAMBLE_1FLIT);
   end function;
 
   function plane_to_id(plane : natural) return std_logic_vector is
@@ -182,41 +211,53 @@ entity proxy_tile is
       when others    => return 0;
     end case;
   end function;
+  
 
 
-  signal st                : state_t := S_IDLE;
-  signal active_plane      : integer range 0 to G_NPLANES - 1 := 0;
-  signal last_grant        : integer range 0 to G_NPLANES - 1 := 0;
-  signal grant_valid       : std_ulogic;
-  signal grant_plane       : integer range 0 to G_NPLANES - 1;
+  signal st               : state_t := S_IDLE;
+signal pkt_kind_reg     : pkt_kind_t := PKT_NONE;
+signal active_plane     : integer range 0 to G_NPLANES - 1 := 0;
+signal last_grant       : integer range 0 to G_NPLANES - 1 := 0;
+signal grant_valid      : std_ulogic;
+signal grant_plane      : integer range 0 to G_NPLANES - 1;
 
-  signal fifo_mem          : fifo_mem_t := (others => (others => (others => '0')));
-  signal fifo_wr_ptr       : ptr_arr_t  := (others => 0);
-  signal fifo_rd_ptr       : ptr_arr_t  := (others => 0);
-  signal fifo_count        : cnt_arr_t  := (others => 0);
-  signal fifo_empty        : std_logic_vector(G_NPLANES - 1 downto 0);
-  signal fifo_full         : std_logic_vector(G_NPLANES - 1 downto 0);
-  signal fifo_wr_en        : std_logic_vector(G_NPLANES - 1 downto 0);
-  signal fifo_rd_en        : std_logic_vector(G_NPLANES - 1 downto 0);
-  signal plane_has_data    : std_logic_vector(G_NPLANES - 1 downto 0);
-  signal eligible_planes   : std_logic_vector(G_NPLANES - 1 downto 0);
-  signal fifo_din_arr      : link_flit_array_t;
-  signal fifo_dout_arr     : link_flit_array_t;
-  signal noc_valid_vec     : std_logic_vector(G_NPLANES - 1 downto 0);
+signal fifo_mem         : fifo_mem_t := (others => (others => (others => '0')));
+signal fifo_wr_ptr      : ptr_arr_t  := (others => 0);
+signal fifo_rd_ptr      : ptr_arr_t  := (others => 0);
+signal fifo_count       : cnt_arr_t  := (others => 0);
+signal fifo_empty       : std_logic_vector(G_NPLANES - 1 downto 0);
+signal fifo_full        : std_logic_vector(G_NPLANES - 1 downto 0);
+signal fifo_wr_en       : std_logic_vector(G_NPLANES - 1 downto 0);
+signal fifo_rd_en       : std_logic_vector(G_NPLANES - 1 downto 0);
+signal plane_has_data   : std_logic_vector(G_NPLANES - 1 downto 0);
+signal eligible_planes  : std_logic_vector(G_NPLANES - 1 downto 0);
+signal fifo_din_arr     : link_flit_array_t;
+signal fifo_dout_arr    : link_flit_array_t;
+signal noc_valid_vec    : std_logic_vector(G_NPLANES - 1 downto 0);
 
-  signal credits           : unsigned(G_CREDIT_WIDTH - 1 downto 0);
-  signal tx_credit_ok      : std_ulogic;
-  signal tx_flit_int       : link_flit_t;
-  signal tx_valid_int      : std_ulogic;
-  signal tx_plane_int      : std_logic_vector(2 downto 0);
-  signal tx_fire           : std_ulogic;
-  signal tx_flit_hold  : link_flit_t := (others => '0');
-signal tx_plane_hold : std_logic_vector(2 downto 0) := (others => '0');
+signal hdr_reg          : link_flit_t := (others => '0');
+signal addr_reg         : link_flit_t := (others => '0');
+signal len_reg          : link_flit_t := (others => '0');
+signal meta_tx_idx      : integer range 0 to 2 := 0;
 
-  signal rx_ready_int      : std_ulogic;
-  signal rx_fire           : std_ulogic;
-  signal credit_pulse_int  : std_ulogic;
-  signal rx_target_plane   : integer range 0 to G_NPLANES - 1;
+signal credits          : unsigned(G_CREDIT_WIDTH - 1 downto 0);
+signal tx_credit_ok     : std_ulogic;
+signal tx_flit_int      : link_flit_t;
+signal tx_valid_int     : std_ulogic;
+signal tx_plane_int     : std_logic_vector(2 downto 0);
+signal tx_fire          : std_ulogic;
+
+signal req_plane_reg    : integer range 0 to G_NPLANES - 1 := 0;
+signal read_pending     : std_logic := '0';
+signal rx_ready_int     : std_ulogic;
+signal rx_fire          : std_ulogic;
+signal credit_pulse_int : std_ulogic;
+signal rx_target_plane  : integer range 0 to G_NPLANES - 1;
+signal rx_read_done     : std_logic;
+
+
+
+  
   begin
     assert COH_NOC_FLIT_SIZE = DMA_NOC_FLIT_SIZE
     report "proxy_tile assumes COH and DMA planes use the same 66-bit link width"
@@ -307,10 +348,8 @@ signal tx_plane_hold : std_logic_vector(2 downto 0) := (others => '0');
     end if;
   end process;
 
-
   -----------------------------------------------------------------------------
-  -- Round-robin arbiter over NON-EMPTY plane FIFOs.
-  -- Only used when the transaction FSM is idle.
+  -- Round-robin arbiter over packet heads
   -----------------------------------------------------------------------------
   eligible_gen : for i in 0 to G_NPLANES - 1 generate
   begin
@@ -329,6 +368,7 @@ signal tx_plane_hold : std_logic_vector(2 downto 0) := (others => '0');
       grant_valid <= '1';
     end if;
   end process;
+
 
   -----------------------------------------------------------------------------
   -- Credit counter
@@ -357,56 +397,145 @@ signal tx_plane_hold : std_logic_vector(2 downto 0) := (others => '0');
   -----------------------------------------------------------------------------
   process(all)
 begin
-  tx_flit_int  <= tx_flit_hold;
+  tx_flit_int  <= (others => '0');
   tx_valid_int <= '0';
-  tx_plane_int <= tx_plane_hold;
+  tx_plane_int <= plane_to_id(active_plane);
   fifo_rd_en   <= (others => '0');
 
-  if st = S_SEND_PKT then
-    tx_valid_int <= plane_has_data(active_plane) and tx_credit_ok;
-    fifo_rd_en(active_plane) <= tx_ready_i and tx_credit_ok and plane_has_data(active_plane);
-  end if;
+  case st is
+    -- Parse stages: pop one flit from the selected FIFO
+    when S_HDR | S_ADDR | S_LEN =>
+      if plane_has_data(active_plane) = '1' then
+        fifo_rd_en(active_plane) <= '1';
+      end if;
+
+    -- Read TX: send stored header/address/length
+    when S_RD_TX =>
+      if tx_credit_ok = '1' then
+        tx_valid_int <= '1';
+        case meta_tx_idx is
+          when 0      => tx_flit_int <= hdr_reg;
+          when 1      => tx_flit_int <= addr_reg;
+          when others => tx_flit_int <= len_reg;
+        end case;
+      end if;
+
+    -- Write TX metadata: send stored header/address/length
+    when S_WR_TX_META =>
+      if tx_credit_ok = '1' then
+        tx_valid_int <= '1';
+        case meta_tx_idx is
+          when 0      => tx_flit_int <= hdr_reg;
+          when 1      => tx_flit_int <= addr_reg;
+          when others => tx_flit_int <= len_reg;
+        end case;
+      end if;
+
+    -- Write TX data: stream data flits directly from FIFO
+    when S_WR_TX_DATA =>
+      tx_flit_int <= fifo_dout_arr(active_plane);
+      tx_valid_int <= plane_has_data(active_plane) and tx_credit_ok;
+      fifo_rd_en(active_plane) <= tx_ready_i and tx_credit_ok and plane_has_data(active_plane);
+
+    when others =>
+      null;
+  end case;
 end process;
 
-  tx_fire <= tx_valid_int and tx_ready_i;
+tx_fire <= tx_valid_int and tx_ready_i;
   ---------------------------------------------------------------------------
   -- Main FSM: lock a plane, then keep forwarding until TAIL / 1FLIT.
   ---------------------------------------------------------------------------
   process(clk, rstn)
-  variable next_ptr : integer range 0 to G_FIFO_DEPTH - 1;
 begin
   if rstn = '0' then
     st            <= S_IDLE;
+    pkt_kind_reg  <= PKT_NONE;
     active_plane  <= 0;
     last_grant    <= 0;
-    tx_flit_hold  <= (others => '0');
-    tx_plane_hold <= (others => '0');
+    hdr_reg       <= (others => '0');
+    addr_reg      <= (others => '0');
+    len_reg       <= (others => '0');
+    meta_tx_idx   <= 0;
+    req_plane_reg <= 0;
+    read_pending  <= '0';
 
   elsif rising_edge(clk) then
     case st is
+
       when S_IDLE =>
+        pkt_kind_reg <= PKT_NONE;
         if grant_valid = '1' then
-          active_plane  <= grant_plane;
-          last_grant    <= grant_plane;
-          tx_flit_hold  <= fifo_dout_arr(grant_plane);
-          tx_plane_hold <= plane_to_id(grant_plane);
-          st            <= S_SEND_PKT;
+          active_plane <= grant_plane;
+          last_grant   <= grant_plane;
+          st           <= S_HDR;
         end if;
 
-      when S_SEND_PKT =>
-        if tx_fire = '1' then
+      when S_HDR =>
+        if plane_has_data(active_plane) = '1' then
+          hdr_reg <= fifo_dout_arr(active_plane);
+          st      <= S_ADDR;
+        end if;
+
+      when S_ADDR =>
+        if plane_has_data(active_plane) = '1' then
+          addr_reg <= fifo_dout_arr(active_plane);
+          st       <= S_LEN;
+        end if;
+
+      when S_LEN =>
+        if plane_has_data(active_plane) = '1' then
+          len_reg     <= fifo_dout_arr(active_plane);
+          meta_tx_idx <= 0;
+
+          -- Option B rule:
+          -- if length flit is tail, this is a read request
+          -- otherwise it is a write request followed by data
           if plane_is_tail(active_plane, fifo_dout_arr(active_plane)) then
-            st <= S_IDLE;
+            pkt_kind_reg <= PKT_READ;
+            st           <= S_RD_TX;
           else
-            next_ptr := inc_ptr(fifo_rd_ptr(active_plane));
-            tx_flit_hold  <= fifo_mem(active_plane)(next_ptr);
-            tx_plane_hold <= plane_to_id(active_plane);
+            pkt_kind_reg <= PKT_WRITE;
+            st           <= S_WR_TX_META;
           end if;
         end if;
+
+      when S_RD_TX =>
+        if tx_fire = '1' then
+          if meta_tx_idx = 2 then
+            req_plane_reg <= active_plane;
+            read_pending  <= '1';
+            st            <= S_RD_WAIT;
+          else
+            meta_tx_idx <= meta_tx_idx + 1;
+          end if;
+        end if;
+
+      when S_RD_WAIT =>
+        if rx_read_done = '1' then
+          read_pending <= '0';
+          pkt_kind_reg <= PKT_NONE;
+          st           <= S_IDLE;
+        end if;
+
+      when S_WR_TX_META =>
+        if tx_fire = '1' then
+          if meta_tx_idx = 2 then
+            st <= S_WR_TX_DATA;
+          else
+            meta_tx_idx <= meta_tx_idx + 1;
+          end if;
+        end if;
+
+      when S_WR_TX_DATA =>
+        if (tx_fire = '1') and plane_is_tail(active_plane, fifo_dout_arr(active_plane)) then
+          pkt_kind_reg <= PKT_NONE;
+          st           <= S_IDLE;
+        end if;
+
     end case;
   end if;
 end process;
-
 ---------------------------------------------------------------------------
   -- Reverse link routing back into the correct local NoC plane.
   -- The reverse link already preserves packet order; no extra RX FSM needed.
@@ -463,6 +592,13 @@ end process;
 
   rx_fire          <= rx_valid_i and rx_ready_int;
   credit_pulse_int <= rx_fire;  
+  rx_read_done <= '1' when
+  (rx_fire = '1') and
+  (read_pending = '1') and
+  (rx_target_plane = req_plane_reg) and
+  plane_is_tail(req_plane_reg, link_flit_t(rx_flit_i))
+else
+  '0';
 
   -----------------------------------------------------------------------------
   -- Outputs
@@ -476,7 +612,17 @@ end process;
   credit_pulse_o <= credit_pulse_int;
     dbg_fifo_wr_ptr_0 <= fifo_wr_ptr(0);
   dbg_fifo_count_0  <= fifo_count(0);
-  dbg_state <= 0 when st = S_IDLE else 1;
+
+  dbg_state <=
+    0  when st = S_IDLE       else
+    1  when st = S_HDR        else
+    2  when st = S_ADDR       else
+    3  when st = S_LEN        else
+    4  when st = S_RD_TX      else
+    5  when st = S_RD_WAIT    else
+    6  when st = S_WR_TX_META else
+    7  when st = S_WR_TX_DATA else
+    15;
 
 
   -- rx_clk_i is intentionally unused in this version. If RX is truly in another
