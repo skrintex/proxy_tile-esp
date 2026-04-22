@@ -107,9 +107,7 @@ entity proxy_tile is
   S_HDR,
   S_ADDR,
   S_LEN,
-  S_RD_TX,
   S_RD_WAIT,
-  S_WR_TX_META,
   S_WR_TX_DATA
 );
 type pkt_kind_t is (PKT_NONE, PKT_READ, PKT_WRITE);
@@ -404,32 +402,11 @@ begin
 
   case st is
     -- Parse stages: pop one flit from the selected FIFO
-    when S_HDR | S_ADDR | S_LEN =>
-      if plane_has_data(active_plane) = '1' then
-        fifo_rd_en(active_plane) <= '1';
-      end if;
+     when S_HDR | S_ADDR | S_LEN =>
+      tx_flit_int  <= fifo_dout_arr(active_plane);
+      tx_valid_int <= plane_has_data(active_plane) and tx_credit_ok;
+      fifo_rd_en(active_plane) <= tx_ready_i and tx_credit_ok and plane_has_data(active_plane);
 
-    -- Read TX: send stored header/address/length
-    when S_RD_TX =>
-      if tx_credit_ok = '1' then
-        tx_valid_int <= '1';
-        case meta_tx_idx is
-          when 0      => tx_flit_int <= hdr_reg;
-          when 1      => tx_flit_int <= addr_reg;
-          when others => tx_flit_int <= len_reg;
-        end case;
-      end if;
-
-    -- Write TX metadata: send stored header/address/length
-    when S_WR_TX_META =>
-      if tx_credit_ok = '1' then
-        tx_valid_int <= '1';
-        case meta_tx_idx is
-          when 0      => tx_flit_int <= hdr_reg;
-          when 1      => tx_flit_int <= addr_reg;
-          when others => tx_flit_int <= len_reg;
-        end case;
-      end if;
 
     -- Write TX data: stream data flits directly from FIFO
     when S_WR_TX_DATA =>
@@ -472,20 +449,17 @@ begin
         end if;
 
       when S_HDR =>
-        if plane_has_data(active_plane) = '1' then
-          hdr_reg <= fifo_dout_arr(active_plane);
+        if tx_fire = '1' then
           st      <= S_ADDR;
         end if;
 
       when S_ADDR =>
-        if plane_has_data(active_plane) = '1' then
-          addr_reg <= fifo_dout_arr(active_plane);
+        if tx_fire = '1' then
           st       <= S_LEN;
         end if;
 
       when S_LEN =>
-        if plane_has_data(active_plane) = '1' then
-          len_reg     <= fifo_dout_arr(active_plane);
+        if tx_fire = '1' then
           meta_tx_idx <= 0;
 
           -- Option B rule:
@@ -493,23 +467,16 @@ begin
           -- otherwise it is a write request followed by data
           if plane_is_tail(active_plane, fifo_dout_arr(active_plane)) then
             pkt_kind_reg <= PKT_READ;
-            st           <= S_RD_TX;
+            req_plane_reg <= active_plane;
+            read_pending <= '1';
+            st           <= S_RD_WAIT;
           else
             pkt_kind_reg <= PKT_WRITE;
-            st           <= S_WR_TX_META;
+            st           <= S_WR_TX_DATA;
           end if;
         end if;
 
-      when S_RD_TX =>
-        if tx_fire = '1' then
-          if meta_tx_idx = 2 then
-            req_plane_reg <= active_plane;
-            read_pending  <= '1';
-            st            <= S_RD_WAIT;
-          else
-            meta_tx_idx <= meta_tx_idx + 1;
-          end if;
-        end if;
+      
 
       when S_RD_WAIT =>
         if rx_read_done = '1' then
@@ -518,14 +485,7 @@ begin
           st           <= S_IDLE;
         end if;
 
-      when S_WR_TX_META =>
-        if tx_fire = '1' then
-          if meta_tx_idx = 2 then
-            st <= S_WR_TX_DATA;
-          else
-            meta_tx_idx <= meta_tx_idx + 1;
-          end if;
-        end if;
+      
 
       when S_WR_TX_DATA =>
         if (tx_fire = '1') and plane_is_tail(active_plane, fifo_dout_arr(active_plane)) then
@@ -563,27 +523,27 @@ end process;
     case rx_target_plane is
       when 0 =>
         noc1_in_data <= coh_noc_flit_type(rx_flit_i(COH_NOC_FLIT_SIZE-1 downto 0));
-        noc1_in_void <= not rx_valid_i;
+        noc1_in_void <= not (rx_valid_i and (not noc1_in_stop));
         rx_ready_int <= not noc1_in_stop;
       when 1 =>
         noc2_in_data <= coh_noc_flit_type(rx_flit_i(COH_NOC_FLIT_SIZE-1 downto 0));
-        noc2_in_void <= not rx_valid_i;
+        noc2_in_void <= not (rx_valid_i and (not noc2_in_stop));
         rx_ready_int <= not noc2_in_stop;
       when 2 =>
         noc3_in_data <= coh_noc_flit_type(rx_flit_i(COH_NOC_FLIT_SIZE-1 downto 0));
-        noc3_in_void <= not rx_valid_i;
+        noc3_in_void <= not (rx_valid_i and (not noc3_in_stop));
         rx_ready_int <= not noc3_in_stop;
       when 3 =>
         noc4_in_data <= dma_noc_flit_type(rx_flit_i(DMA_NOC_FLIT_SIZE-1 downto 0));
-        noc4_in_void <= not rx_valid_i;
+        noc4_in_void <= not (rx_valid_i and (not noc4_in_stop));
         rx_ready_int <= not noc4_in_stop;
       when 4 =>
         noc5_in_data <= misc_noc_flit_type(rx_flit_i(MISC_NOC_FLIT_SIZE-1 downto 0));
-        noc5_in_void <= not rx_valid_i;
+        noc5_in_void <= not (rx_valid_i and (not noc5_in_stop));
         rx_ready_int <= not noc5_in_stop;
       when 5 =>
         noc6_in_data <= dma_noc_flit_type(rx_flit_i(DMA_NOC_FLIT_SIZE-1 downto 0));
-        noc6_in_void <= not rx_valid_i;
+        noc6_in_void <= not (rx_valid_i and (not noc6_in_stop));
         rx_ready_int <= not noc6_in_stop;
       when others =>
         rx_ready_int <= '0';
@@ -593,10 +553,12 @@ end process;
   rx_fire          <= rx_valid_i and rx_ready_int;
   credit_pulse_int <= rx_fire;  
   rx_read_done <= '1' when
+  (st = S_RD_WAIT) and
   (rx_fire = '1') and
   (read_pending = '1') and
   (rx_target_plane = req_plane_reg) and
-  plane_is_tail(req_plane_reg, link_flit_t(rx_flit_i))
+  --plane_is_tail(req_plane_reg, link_flit_t(rx_flit_i))
+  (rx_target_plane = req_plane_reg)
 else
   '0';
 
@@ -618,10 +580,8 @@ else
     1  when st = S_HDR        else
     2  when st = S_ADDR       else
     3  when st = S_LEN        else
-    4  when st = S_RD_TX      else
-    5  when st = S_RD_WAIT    else
-    6  when st = S_WR_TX_META else
-    7  when st = S_WR_TX_DATA else
+    4  when st = S_RD_WAIT    else
+    5  when st = S_WR_TX_DATA else
     15;
 
 
